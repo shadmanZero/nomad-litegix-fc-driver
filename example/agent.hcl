@@ -3,8 +3,9 @@
 
 log_level = "TRACE"
 
-plugin "hello-driver" {
+plugin "litegix-fc-driver" {
   config {
-    shell = "bash"
+    vmlinux_path = "/path/to/vmlinux"
+    rootfs_base_path = "/tmp/litegix-rootfs"
   }
 }
