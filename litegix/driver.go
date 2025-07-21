@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -255,26 +256,38 @@ func (d *LitegixDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskH
 
 	d.logger.Info("starting task", "driver_cfg", hclog.Fmt("%+v", driverConfig))
 
-	// Create and start the VM using the VM manager
-	ctx := context.Background()
-	vmInfo, err := d.vmManager.CreateAndStartVM(ctx, &driverConfig, cfg.ID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create and start VM: %w", err)
-	}
-
-	// Create task handle
-	handle := drivers.NewTaskHandle(taskHandleVersion)
-	handle.Config = cfg
-
-	// Create our internal task handle
+	// Create our internal task handle first, so we can clean up resources if VM start fails
 	h := &taskHandle{
 		taskConfig: cfg,
 		logger:     d.logger.With("task_id", cfg.ID),
-		startedAt:  time.Now(),
-		procState:  drivers.TaskStateRunning,
-		vmInfo:     vmInfo,
 		vmManager:  d.vmManager,
 	}
+
+	// Open Nomad's log FIFOs
+	var err error
+	h.stdout, h.stderr, err = d.openLogFIFOs(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open log FIFOs: %w", err)
+	}
+
+	// Create and start the VM
+	ctx := context.Background()
+	h.vmInfo, err = d.vmManager.CreateAndStartVM(ctx, &driverConfig, cfg.ID, h.stdout, h.stderr)
+	if err != nil {
+		h.stdout.Close()
+		h.stderr.Close()
+		return nil, nil, fmt.Errorf("failed to create and start VM: %w", err)
+	}
+
+	// Update handle fields after successful start
+	h.stateLock.Lock()
+	h.startedAt = time.Now()
+	h.procState = drivers.TaskStateRunning
+	h.stateLock.Unlock()
+
+	// Create Nomad's task handle
+	handle := drivers.NewTaskHandle(taskHandleVersion)
+	handle.Config = cfg
 
 	// Save driver state
 	driverState := TaskState{
@@ -285,13 +298,59 @@ func (d *LitegixDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskH
 
 	if err := handle.SetDriverState(&driverState); err != nil {
 		// Clean up VM on error
-		d.vmManager.DestroyVM(ctx, vmInfo)
+		d.vmManager.DestroyVM(ctx, h.vmInfo)
+		h.stdout.Close()
+		h.stderr.Close()
 		return nil, nil, fmt.Errorf("failed to set driver state: %v", err)
 	}
 
 	d.tasks.Set(cfg.ID, h)
 	go h.run()
 	return handle, nil, nil
+}
+
+// openLogFIFOs opens the stdout and stderr pipes that Nomad provides for log shipping.
+func (d *LitegixDriverPlugin) openLogFIFOs(cfg *drivers.TaskConfig) (io.WriteCloser, io.WriteCloser, error) {
+	// Nomad provides these paths via environment variables to the plugin process.
+	stdoutPath := cfg.Env[drivers.EnvTaskStdout]
+	stderrPath := cfg.Env[drivers.EnvTaskStderr]
+
+	d.logger.Debug("opening task log FIFOs", "stdout", stdoutPath, "stderr", stderrPath)
+
+	type fifoResult struct {
+		stdout io.WriteCloser
+		stderr io.WriteCloser
+		err    error
+	}
+	ch := make(chan fifoResult)
+
+	go func() {
+		var res fifoResult
+		var err error
+
+		res.stdout, err = os.OpenFile(stdoutPath, os.O_WRONLY, 0)
+		if err != nil {
+			res.err = fmt.Errorf("failed to open stdout fifo at %s: %w", stdoutPath, err)
+			ch <- res
+			return
+		}
+
+		res.stderr, err = os.OpenFile(stderrPath, os.O_WRONLY, 0)
+		if err != nil {
+			res.err = fmt.Errorf("failed to open stderr fifo at %s: %w", stderrPath, err)
+			res.stdout.Close() // clean up
+			ch <- res
+			return
+		}
+		ch <- res
+	}()
+
+	select {
+	case res := <-ch:
+		return res.stdout, res.stderr, res.err
+	case <-time.After(15 * time.Second):
+		return nil, nil, fmt.Errorf("timeout opening log FIFOs")
+	}
 }
 
 // RecoverTask recreates the in-memory state of a task from a TaskHandle.
@@ -415,6 +474,14 @@ func (d *LitegixDriverPlugin) DestroyTask(taskID string, force bool) error {
 	}
 
 	d.logger.Info("destroying task", "task_id", taskID, "force", force)
+
+	// Close log pipes
+	if handle.stdout != nil {
+		handle.stdout.Close()
+	}
+	if handle.stderr != nil {
+		handle.stderr.Close()
+	}
 
 	// Use the VM manager to destroy the VM
 	ctx := context.Background()

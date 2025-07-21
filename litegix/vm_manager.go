@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +31,7 @@ const (
 )
 
 type VMManager interface {
-	CreateAndStartVM(ctx context.Context, config *TaskConfig, taskID string) (*VMInfo, error)
+	CreateAndStartVM(ctx context.Context, config *TaskConfig, taskID string, stdout, stderr io.Writer) (*VMInfo, error)
 	StopVM(ctx context.Context, vmInfo *VMInfo, timeout time.Duration) error
 	DestroyVM(ctx context.Context, vmInfo *VMInfo) error
 	GetVMStatus(ctx context.Context, vmInfo *VMInfo) (*VMStatus, error)
@@ -228,12 +229,69 @@ func (vm *firecrackerVMManager) createRootfs(ctx context.Context, imageDir, root
 		logger.Warn("failed to add VM agent", "error", err)
 		// Continue without agent - exec will still work in fallback mode
 	}
-	
+
+	// Create an /init script to run the user's command
+	if err := vm.createInitScript(mountDir, config); err != nil {
+		logger.Error("failed to create /init script", "error", err)
+		return fmt.Errorf("failed to create /init script: %w", err)
+	}
+
 	logger.Info("successfully created rootfs", "size_mb", sizeMB)
 	return nil
 }
 
-func (vm *firecrackerVMManager) CreateAndStartVM(ctx context.Context, config *TaskConfig, taskID string) (*VMInfo, error) {
+// createInitScript creates a simple /init script inside the rootfs that will
+// execute the task's command.
+func (vm *firecrackerVMManager) createInitScript(mountDir string, taskConfig *TaskConfig) error {
+	initScriptPath := filepath.Join(mountDir, "init")
+	var commandToRun string
+
+	if taskConfig.Command != "" {
+		commandToRun = fmt.Sprintf("%s %s", taskConfig.Command, taskConfig.Args)
+	} else {
+		commandToRun = taskConfig.Args
+	}
+
+	// This is a very basic init script. A more robust implementation might
+	// use a proper init system like tini or a simple Go program.
+	scriptContent := fmt.Sprintf(`#!/bin/sh
+# This script is PID 1 in the VM. It executes the user's command.
+echo "VM init script started"
+
+# Setup basic environment
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+%s
+
+# Execute the user's command
+echo "Executing command: %s"
+%s
+
+# After command finishes, power off the VM
+echo "Command finished with exit code $?. Shutting down."
+poweroff -f
+`, envVarsToString(taskConfig.Env), commandToRun, commandToRun)
+
+	err := os.WriteFile(initScriptPath, []byte(scriptContent), 0755)
+	if err != nil {
+		return fmt.Errorf("failed to write /init script: %w", err)
+	}
+
+	vm.logger.Info("created /init script", "command", commandToRun)
+	return nil
+}
+
+// envVarsToString converts a slice of env vars to a string of export statements.
+func envVarsToString(env []string) string {
+	var builder strings.Builder
+	for _, e := range env {
+		builder.WriteString(fmt.Sprintf("export %s\n", e))
+	}
+	return builder.String()
+}
+
+
+func (vm *firecrackerVMManager) CreateAndStartVM(ctx context.Context, config *TaskConfig, taskID string, stdout, stderr io.Writer) (*VMInfo, error) {
 	logger := vm.logger.With("task_id", taskID, "image", config.Image)
 	
 	// Create directories for this VM
@@ -289,12 +347,16 @@ func (vm *firecrackerVMManager) CreateAndStartVM(ctx context.Context, config *Ta
 	fcConfig := firecracker.Config{
 		SocketPath:      socketPath,
 		KernelImagePath: vm.config.VmlinuxPath,
-		KernelArgs:      "console=ttyS0 reboot=k panic=1 pci=off",
+		KernelArgs:      "console=ttyS0 reboot=k panic=1 pci=off init=/init",
 		Drives:          drives,
 		MachineCfg:      machineConfig,
 		VsockDevices:    vsockDevices,
+		LogWriter:       stdout, // Use a single writer for combined output
 	}
-	
+	// Note: Firecracker SDK uses one writer for both stdout and stderr from the console.
+	// We are directing the VM's console output to Nomad's stdout pipe.
+	_ = stderr // stderr is opened but currently unused by the FC SDK in this way.
+
 	// Create and start the VM
 	logger.Info("starting firecracker VM")
 	machine, err := firecracker.NewMachine(ctx, fcConfig)
@@ -407,4 +469,44 @@ func (vm *firecrackerVMManager) GetVMStatus(ctx context.Context, vmInfo *VMInfo)
 		State: VMStateRunning,
 		PID:   vmInfo.PID,
 	}, nil
+}
+
+// Helper function to add agent to rootfs during VM creation
+func (vm *firecrackerVMManager) addVMAgentToRootfs(mountDir string) error {
+	vm.logger.Info("adding VM agent to rootfs", "mount_dir", mountDir)
+
+	// Create init.d directory
+	initDir := filepath.Join(mountDir, "init.d")
+	if err := os.MkdirAll(initDir, 0755); err != nil {
+		return fmt.Errorf("failed to create init.d directory: %w", err)
+	}
+
+	// Create VM agent script
+	vmAgentScript := filepath.Join(initDir, "vm-agent")
+	vmAgentContent := `#!/bin/sh
+# This script is PID 1 in the VM. It executes the user's command.
+echo "VM init script started"
+
+# Setup basic environment
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+%s
+
+# Execute the user's command
+echo "Executing command: %s"
+%s
+
+# After command finishes, power off the VM
+echo "Command finished with exit code $?. Shutting down."
+poweroff -f
+`
+
+	// Create symlink for auto-start in common runlevel directories
+	os.MkdirAll(mountDir+"/etc/rc.d", 0755)
+	os.Symlink("../init.d/vm-agent", mountDir+"/etc/rc.d/S99vm-agent")
+	os.MkdirAll(mountDir+"/etc/rc5.d", 0755)
+	os.Symlink("../init.d/vm-agent", mountDir+"/etc/rc5.d/S99vm-agent")
+
+	vm.logger.Info("VM agent added to rootfs")
+	return nil
 }
