@@ -312,8 +312,14 @@ func (d *LitegixDriverPlugin) StartTask(cfg *drivers.TaskConfig) (*drivers.TaskH
 // openLogFIFOs opens the stdout and stderr pipes that Nomad provides for log shipping.
 func (d *LitegixDriverPlugin) openLogFIFOs(cfg *drivers.TaskConfig) (io.WriteCloser, io.WriteCloser, error) {
 	// Nomad provides these paths via environment variables to the plugin process.
-	stdoutPath := cfg.Env[drivers.EnvTaskStdout]
-	stderrPath := cfg.Env[drivers.EnvTaskStderr]
+	stdoutPath, ok := cfg.Env[drivers.NomadTaskStdout]
+	if !ok {
+		return nil, nil, fmt.Errorf("could not find stdout path in task environment")
+	}
+	stderrPath, ok := cfg.Env[drivers.NomadTaskStderr]
+	if !ok {
+		return nil, nil, fmt.Errorf("could not find stderr path in task environment")
+	}
 
 	d.logger.Debug("opening task log FIFOs", "stdout", stdoutPath, "stderr", stderrPath)
 

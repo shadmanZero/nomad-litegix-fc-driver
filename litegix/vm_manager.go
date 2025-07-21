@@ -247,9 +247,10 @@ func (vm *firecrackerVMManager) createInitScript(mountDir string, taskConfig *Ta
 	var commandToRun string
 
 	if taskConfig.Command != "" {
-		commandToRun = fmt.Sprintf("%s %s", taskConfig.Command, taskConfig.Args)
+		commandToRun = fmt.Sprintf("exec %s %s", taskConfig.Command, taskConfig.Args)
 	} else {
-		commandToRun = taskConfig.Args
+		// If no command is given, just start a shell
+		commandToRun = "exec /bin/sh"
 	}
 
 	// This is a very basic init script. A more robust implementation might
@@ -351,23 +352,23 @@ func (vm *firecrackerVMManager) CreateAndStartVM(ctx context.Context, config *Ta
 		Drives:          drives,
 		MachineCfg:      machineConfig,
 		VsockDevices:    vsockDevices,
-		LogWriter:       stdout, // Use a single writer for combined output
 	}
-	// Note: Firecracker SDK uses one writer for both stdout and stderr from the console.
-	// We are directing the VM's console output to Nomad's stdout pipe.
-	_ = stderr // stderr is opened but currently unused by the FC SDK in this way.
 
+	// Create a context for the machine, and wire up the stdio.
+	machineCtx, machineCancel := context.WithCancel(ctx)
+	
 	// Create and start the VM
-	logger.Info("starting firecracker VM")
-	machine, err := firecracker.NewMachine(ctx, fcConfig)
+	machine, err := firecracker.NewMachine(machineCtx, fcConfig, firecracker.Withstdio(os.Stdin, stdout, stderr))
 	if err != nil {
+		machineCancel()
 		return nil, fmt.Errorf("failed to create firecracker machine: %w", err)
 	}
 	
-	if err := machine.Start(ctx); err != nil {
+	if err := machine.Start(machineCtx); err != nil {
+		machineCancel()
 		return nil, fmt.Errorf("failed to start firecracker VM: %w", err)
 	}
-	
+
 	// Get the PID
 	pid, err := machine.PID()
 	if err != nil {
@@ -476,36 +477,41 @@ func (vm *firecrackerVMManager) addVMAgentToRootfs(mountDir string) error {
 	vm.logger.Info("adding VM agent to rootfs", "mount_dir", mountDir)
 
 	// Create init.d directory
-	initDir := filepath.Join(mountDir, "init.d")
+	initDir := filepath.Join(mountDir, "etc", "init.d")
 	if err := os.MkdirAll(initDir, 0755); err != nil {
 		return fmt.Errorf("failed to create init.d directory: %w", err)
 	}
 
 	// Create VM agent script
-	vmAgentScript := filepath.Join(initDir, "vm-agent")
+	vmAgentScriptPath := filepath.Join(initDir, "vm-agent")
 	vmAgentContent := `#!/bin/sh
-# This script is PID 1 in the VM. It executes the user's command.
-echo "VM init script started"
+# VM Agent for command execution
+echo "VM Agent starting..."
 
-# Setup basic environment
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=/root
-%s
-
-# Execute the user's command
-echo "Executing command: %s"
-%s
-
-# After command finishes, power off the VM
-echo "Command finished with exit code $?. Shutting down."
-poweroff -f
+# Simple netcat-based agent for exec
+while true; do
+    nc -l -p 1024 -e /bin/sh 2>/dev/null || {
+        # Fallback for systems without netcat's -e
+        (echo "VM Agent Ready"; while read line; do eval "$line" 2>&1; done) | nc -l -p 1024
+    }
+done
 `
+	if err := os.WriteFile(vmAgentScriptPath, []byte(vmAgentContent), 0755); err != nil {
+		return fmt.Errorf("failed to write vm-agent script: %w", err)
+	}
 
-	// Create symlink for auto-start in common runlevel directories
-	os.MkdirAll(mountDir+"/etc/rc.d", 0755)
-	os.Symlink("../init.d/vm-agent", mountDir+"/etc/rc.d/S99vm-agent")
-	os.MkdirAll(mountDir+"/etc/rc5.d", 0755)
-	os.Symlink("../init.d/vm-agent", mountDir+"/etc/rc5.d/S99vm-agent")
+	// Create symlink for auto-start
+	rcDir := filepath.Join(mountDir, "etc", "rc5.d")
+	if err := os.MkdirAll(rcDir, 0755); err != nil {
+		return fmt.Errorf("failed to create rc.d directory: %w", err)
+	}
+	symlinkPath := filepath.Join(rcDir, "S99vm-agent")
+	if err := os.Symlink("../../init.d/vm-agent", symlinkPath); err != nil {
+		// Don't fail if symlink exists
+		if !os.IsExist(err) {
+			return fmt.Errorf("failed to create vm-agent symlink: %w", err)
+		}
+	}
 
 	vm.logger.Info("VM agent added to rootfs")
 	return nil
