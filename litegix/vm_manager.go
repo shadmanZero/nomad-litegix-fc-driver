@@ -52,6 +52,7 @@ type VMInfo struct {
 	RootfsPath  string
 	PID         uint32
 	CreatedAt   time.Time
+	ExecClient  *VMExecClient
 }
 
 type firecrackerVMManager struct {
@@ -222,6 +223,12 @@ func (vm *firecrackerVMManager) createRootfs(ctx context.Context, imageDir, root
 		return fmt.Errorf("failed to copy filesystem: %w", err)
 	}
 	
+	// Add VM agent for exec support
+	if err := vm.addVMAgentToRootfs(mountDir); err != nil {
+		logger.Warn("failed to add VM agent", "error", err)
+		// Continue without agent - exec will still work in fallback mode
+	}
+	
 	logger.Info("successfully created rootfs", "size_mb", sizeMB)
 	return nil
 }
@@ -264,6 +271,14 @@ func (vm *firecrackerVMManager) CreateAndStartVM(ctx context.Context, config *Ta
 		},
 	}
 	
+	// Configure vsock for exec communication
+	vsockDevices := []firecracker.VsockDevice{
+		{
+			Path: socketPath + ".vsock",
+			CID:  3,   // Guest CID
+		},
+	}
+	
 	// Configure machine
 	machineConfig := models.MachineConfiguration{
 		VcpuCount:  firecracker.Int64(int64(config.VpuCount)),
@@ -277,6 +292,7 @@ func (vm *firecrackerVMManager) CreateAndStartVM(ctx context.Context, config *Ta
 		KernelArgs:      "console=ttyS0 reboot=k panic=1 pci=off",
 		Drives:          drives,
 		MachineCfg:      machineConfig,
+		VsockDevices:    vsockDevices,
 	}
 	
 	// Create and start the VM
@@ -298,7 +314,8 @@ func (vm *firecrackerVMManager) CreateAndStartVM(ctx context.Context, config *Ta
 	
 	logger.Info("VM started successfully", "vm_id", taskID, "pid", pid)
 	
-	return &VMInfo{
+	// Create VM info with exec client
+	vmInfo := &VMInfo{
 		TaskID:     taskID,
 		VMID:       taskID,
 		Machine:    machine,
@@ -306,7 +323,12 @@ func (vm *firecrackerVMManager) CreateAndStartVM(ctx context.Context, config *Ta
 		RootfsPath: rootfsPath,
 		PID:        uint32(pid),
 		CreatedAt:  time.Now(),
-	}, nil
+	}
+	
+	// Initialize exec client
+	vmInfo.ExecClient = NewVMExecClient(vmInfo, vm.logger)
+	
+	return vmInfo, nil
 }
 
 func (vm *firecrackerVMManager) StopVM(ctx context.Context, vmInfo *VMInfo, timeout time.Duration) error {

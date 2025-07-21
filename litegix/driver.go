@@ -51,7 +51,7 @@ var (
 
 	capabilities = &drivers.Capabilities{
 		SendSignals: true,
-		Exec:        false,
+		Exec:        true,
 	}
 )
 
@@ -523,6 +523,42 @@ func (d *LitegixDriverPlugin) SignalTask(taskID string, signal string) error {
 // ExecTask returns the result of executing the given command inside a task.
 // This is an optional capability.
 func (d *LitegixDriverPlugin) ExecTask(taskID string, cmd []string, timeout time.Duration) (*drivers.ExecTaskResult, error) {
-	// Firecracker VMs don't support exec - would need additional agent inside VM
-	return nil, errors.New("This driver does not support exec")
+	handle, ok := d.tasks.Get(taskID)
+	if !ok {
+		return nil, drivers.ErrTaskNotFound
+	}
+
+	if handle.vmInfo == nil || handle.vmInfo.ExecClient == nil {
+		return nil, fmt.Errorf("VM not available for exec")
+	}
+
+	d.logger.Info("executing command in VM", "task_id", taskID, "command", cmd)
+
+	// Set default timeout if not provided
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Execute command using the VM exec client
+	response, err := handle.vmInfo.ExecClient.ExecuteCommand(ctx, cmd, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute command: %w", err)
+	}
+
+	// Convert to Nomad's ExecTaskResult format
+	result := &drivers.ExecTaskResult{
+		Stdout: []byte(response.Stdout),
+		Stderr: []byte(response.Stderr),
+	}
+	
+	// Set exit code if available
+	if response.ExitCode != 0 {
+		result.Stderr = append(result.Stderr, []byte(fmt.Sprintf("\nExit code: %d", response.ExitCode))...)
+	}
+
+	d.logger.Info("command executed", "task_id", taskID, "exit_code", response.ExitCode)
+	return result, nil
 }
