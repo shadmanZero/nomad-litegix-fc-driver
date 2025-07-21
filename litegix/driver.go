@@ -42,8 +42,8 @@ var (
 
 	taskConfigSpec = hclspec.NewObject(map[string]*hclspec.Spec{
 		"image" : hclspec.NewAttr("image","string",true),
-		"vpu_count" : hclspec.NewAttr("vpu_count","int",true),
-		"mem_size" : hclspec.NewAttr("mem_size","int",true),
+		"vpu_count" : hclspec.NewAttr("vpu_count","number",true),
+		"mem_size" : hclspec.NewAttr("mem_size","number",true),
 		"args" : hclspec.NewAttr("args","string",false),
 		"command" : hclspec.NewAttr("command","string",false),
 		"env" : hclspec.NewAttr("env","list(string)",false),
